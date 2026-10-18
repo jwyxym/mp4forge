@@ -432,26 +432,25 @@ pub(in crate::mux) async fn scan_transport_stream_async(
         last_continuity_counter: None,
     };
     let mut offset = 0_u64;
-    while offset + u64::try_from(TS_PACKET_SIZE).unwrap() <= file_size {
-        let mut packet = [0_u8; TS_PACKET_SIZE];
-        read_exact_at_async(
-            &mut file,
-            offset,
-            &mut packet,
-            spec,
-            "truncated MPEG transport stream packet",
-        )
-        .await?;
-        parse_transport_packet_sync(
-            spec,
-            &packet,
-            offset,
-            &mut pmt_pid,
-            &mut builders,
-            &mut program_clock,
-        )?;
-        offset += u64::try_from(TS_PACKET_SIZE).unwrap();
-    }
+	// Tokio file operations use blocking tasks internally. Read many complete
+	// packets at once instead of scheduling a seek/read pair for every 188 B.
+	const PACKETS_PER_READ: usize = 4096;
+	let mut buffer: Vec<u8> = vec![0; TS_PACKET_SIZE * PACKETS_PER_READ];
+	while file_size - offset >= TS_PACKET_SIZE as u64 {
+		let packet_count: usize = ((file_size - offset) / TS_PACKET_SIZE as u64)
+			.min(PACKETS_PER_READ as u64) as usize;
+		let length: usize = packet_count * TS_PACKET_SIZE;
+		read_exact_at_async(&mut file, offset, &mut buffer[..length], spec,
+			"truncated MPEG transport stream packet").await?;
+		for (index, bytes) in buffer[..length].chunks_exact(TS_PACKET_SIZE).enumerate() {
+			let packet: &[u8; TS_PACKET_SIZE] = bytes.try_into()
+				.map_err(|_| MuxError::LayoutOverflow("transport-stream packet size"))?;
+			let packet_offset: u64 = offset + (index * TS_PACKET_SIZE) as u64;
+			parse_transport_packet_sync(spec, packet, packet_offset, &mut pmt_pid,
+				&mut builders, &mut program_clock)?;
+		}
+		offset += length as u64;
+	}
 
     finalize_transport_tracks_async(path, spec, &mut file, builders).await
 }
@@ -3363,33 +3362,38 @@ fn rescale_transport_h26x_samples(
     spec: &str,
     codec_name: &str,
 ) -> Result<Vec<CandidateSample>, MuxError> {
-    samples
-        .into_iter()
-        .map(|sample| {
-            Ok(CandidateSample {
-                source_index: usize::MAX,
-                data_offset: sample.data_offset,
-                data_size: sample.data_size,
-                duration: u32::try_from(rescale_transport_h26x_time(
-                    i64::from(sample.duration),
-                    source_timescale,
-                    spec,
-                    codec_name,
-                )?)
-                .map_err(|_| MuxError::LayoutOverflow("transport-stream H26x duration rescale"))?,
-                composition_time_offset: i32::try_from(rescale_transport_h26x_time(
-                    i64::from(sample.composition_time_offset),
-                    source_timescale,
-                    spec,
-                    codec_name,
-                )?)
-                .map_err(|_| {
-                    MuxError::LayoutOverflow("transport-stream H26x composition offset rescale")
-                })?,
-                is_sync_sample: sample.is_sync_sample,
-            })
-        })
-        .collect()
+	let mut decode_time: i64 = 0;
+	let mut output: Vec<CandidateSample> = Vec::with_capacity(samples.len());
+	for sample in samples {
+		let end_time: i64 = decode_time.checked_add(i64::from(sample.duration))
+			.ok_or(MuxError::LayoutOverflow("transport-stream H26x decode time"))?;
+		let presentation_time: i64 = decode_time.checked_add(i64::from(sample.composition_time_offset))
+			.ok_or(MuxError::LayoutOverflow("transport-stream H26x presentation time"))?;
+		// Rescale absolute boundaries, not individual durations. For 24000/1001
+		// fps, this distributes 3753/3754 ticks without accumulating drift.
+		let start: i64 = rescale_transport_h26x_time(decode_time, source_timescale, spec, codec_name)?;
+		let end: i64 = rescale_transport_h26x_time(end_time, source_timescale, spec, codec_name)?;
+		let presentation: i64 = rescale_transport_h26x_time(presentation_time, source_timescale, spec, codec_name)?;
+		let duration: u32 = u32::try_from(end - start)
+			.map_err(|_| MuxError::LayoutOverflow("transport-stream H26x duration rescale"))?;
+		if duration == 0 {
+			return Err(MuxError::UnsupportedTrackImport {
+				spec: spec.to_string(),
+				message: format!("transport-stream {codec_name} sample duration is below one 90_000 clock tick"),
+			});
+		}
+		output.push(CandidateSample {
+			source_index: usize::MAX,
+			data_offset: sample.data_offset,
+			data_size: sample.data_size,
+			duration,
+			composition_time_offset: i32::try_from(presentation - start)
+				.map_err(|_| MuxError::LayoutOverflow("transport-stream H26x composition offset rescale"))?,
+			is_sync_sample: sample.is_sync_sample,
+		});
+		decode_time = end_time;
+	}
+	Ok(output)
 }
 
 fn rescale_transport_h26x_edit_media_time(
@@ -3704,16 +3708,10 @@ fn rescale_transport_h26x_time(
         .ok_or(MuxError::LayoutOverflow(
             "transport-stream H26x time rescale",
         ))?;
-    if scaled % u64::from(source_timescale) != 0 {
-        return Err(MuxError::UnsupportedTrackImport {
-            spec: spec.to_string(),
-            message: format!(
-                "transport-stream {codec_name} cadence does not rescale cleanly onto the 90_000 transport clock"
-            ),
-        });
-    }
-    let normalized = scaled / u64::from(source_timescale);
-    let normalized = i64::try_from(normalized)
+	let rounded: u64 = scaled.checked_add(u64::from(source_timescale) / 2)
+		.ok_or(MuxError::LayoutOverflow("transport-stream H26x time rescale"))?;
+	let normalized: u64 = rounded / u64::from(source_timescale);
+	let normalized: i64 = i64::try_from(normalized)
         .map_err(|_| MuxError::LayoutOverflow("transport-stream H26x time rescale"))?;
     Ok(normalized * sign)
 }

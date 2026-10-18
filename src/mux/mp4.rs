@@ -3,6 +3,8 @@ use std::fs::File;
 use std::io::{Cursor, Read, Seek, Write};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(feature = "async")]
+use std::{io, pin::Pin, task::{Context, Poll}};
 
 #[cfg(feature = "async")]
 use tokio::fs::File as TokioFile;
@@ -114,14 +116,64 @@ where
     R: AsyncReadSeek,
     W: AsyncWrite + Unpin,
 {
+	write_mp4_mux_async_with_progress(sources, writer, file_config, track_configs, plan, None).await
+}
+
+#[cfg(feature = "async")]
+struct ProgressWriter<'a, W> {
+	writer: &'a mut W,
+	progress: Option<&'a (dyn Fn(u64, u64) + Send + Sync)>,
+	written: u64,
+	total: u64,
+}
+
+#[cfg(feature = "async")]
+impl<W: AsyncWrite + Unpin> AsyncWrite for ProgressWriter<'_, W> {
+	fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bytes: &[u8]) -> Poll<io::Result<usize>> {
+		match Pin::new(&mut *self.writer).poll_write(cx, bytes) {
+			Poll::Ready(Ok(count)) => {
+				self.written += count as u64;
+				if let Some(progress) = self.progress { progress(self.written, self.total); }
+				Poll::Ready(Ok(count))
+			}
+			other => other,
+		}
+	}
+	fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		Pin::new(&mut *self.writer).poll_flush(cx)
+	}
+	fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+		Pin::new(&mut *self.writer).poll_shutdown(cx)
+	}
+}
+
+#[cfg(feature = "async")]
+pub(super) async fn write_mp4_mux_async_with_progress<R, W>(
+	sources: &mut [R],
+	writer: &mut W,
+	file_config: &MuxFileConfig,
+	track_configs: &[MuxTrackConfig],
+	plan: &MuxPlan,
+	progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+) -> Result<(), MuxError>
+where
+	R: AsyncReadSeek,
+	W: AsyncWrite + Unpin,
+{
     let layout = build_container_layout(file_config, track_configs, plan)?;
+	let total: u64 = [layout.ftyp_bytes.len(), layout.leading_bytes.len(), layout.moov_bytes.len(),
+		layout.mdat_header.len(), layout.trailing_bytes.len()].into_iter()
+		.try_fold(plan.total_payload_size(), |total: u64, size: usize| total.checked_add(size as u64))
+		.ok_or(MuxError::LayoutOverflow("MP4 output progress size"))?;
+	let mut writer: ProgressWriter<'_, W> = ProgressWriter { writer, progress, written: 0, total };
+	if let Some(progress) = progress { progress(0, total); }
     writer.write_all(&layout.ftyp_bytes).await?;
     if !layout.leading_bytes.is_empty() {
         writer.write_all(&layout.leading_bytes).await?;
     }
     writer.write_all(&layout.moov_bytes).await?;
     writer.write_all(&layout.mdat_header).await?;
-    copy_planned_payloads_async(sources, writer, plan).await?;
+    copy_planned_payloads_async(sources, &mut writer, plan).await?;
     if !layout.trailing_bytes.is_empty() {
         writer.write_all(&layout.trailing_bytes).await?;
     }

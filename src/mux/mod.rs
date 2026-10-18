@@ -67,6 +67,8 @@ pub use import::mux_into_path_async;
 pub use import::mux_to_path;
 #[cfg(feature = "async")]
 pub use import::mux_to_path_async;
+#[cfg(feature = "async")]
+pub use import::mux_to_path_async_with_progress;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum MuxRawCodec {

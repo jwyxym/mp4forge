@@ -74,7 +74,8 @@ pub(in crate::mux) fn read_segmented_bytes_sync(
 
     let mut written = 0usize;
     let mut logical_offset = offset;
-    for segment in segments {
+	let first: usize = segments.partition_point(|segment: &SegmentedMuxSourceSegment| segment_logical_end(segment) <= offset);
+    for segment in &segments[first..] {
         if written == buf.len() {
             break;
         }
@@ -184,7 +185,47 @@ pub(in crate::mux) async fn read_segmented_bytes_async(
 
     let mut written = 0usize;
     let mut logical_offset = offset;
-    for segment in segments {
+	let first: usize = segments.partition_point(|segment: &SegmentedMuxSourceSegment| segment_logical_end(segment) <= offset);
+	let logical_end: u64 = offset + buf.len() as u64;
+	let last: usize = segments.partition_point(|segment: &SegmentedMuxSourceSegment| segment.logical_offset < logical_end);
+	// Bulk-copy nearby physical ranges (e.g. TS payloads separated by packet
+	// headers) with one read. Keep the fallback for mixed/external sources.
+	if buf.len() >= 1024 && first < last {
+		let selected: &[SegmentedMuxSourceSegment] = &segments[first..last];
+		let window: Option<(u64, usize)> = (|| -> Option<(u64, usize)> {
+			let mut physical_start: u64 = u64::MAX;
+			let mut physical_end: u64 = 0;
+			let mut cursor: u64 = offset;
+			for segment in selected {
+				let SegmentedMuxSourceSegmentData::FileRange { source_offset, .. } = &segment.data else { return None; };
+				let begin: u64 = offset.max(segment.logical_offset);
+				let end: u64 = logical_end.min(segment_logical_end(segment));
+				if begin != cursor || end <= begin { return None; }
+				let source_begin: u64 = source_offset.checked_add(begin - segment.logical_offset)?;
+				physical_start = physical_start.min(source_begin);
+				physical_end = physical_end.max(source_begin.checked_add(end - begin)?);
+				if physical_end - physical_start > 64 * 1024 { return None; }
+				cursor = end;
+			}
+			(cursor == logical_end).then_some((physical_start, (physical_end - physical_start) as usize))
+		})();
+		if let Some((physical_start, length)) = window {
+			let mut window_bytes: Vec<u8> = vec![0; length];
+			read_exact_at_async(file, physical_start, &mut window_bytes, spec, truncated_message).await?;
+			for segment in selected {
+				if let SegmentedMuxSourceSegmentData::FileRange { source_offset, .. } = &segment.data {
+					let begin: u64 = offset.max(segment.logical_offset);
+					let end: u64 = logical_end.min(segment_logical_end(segment));
+					let source: usize = (source_offset + (begin - segment.logical_offset) - physical_start) as usize;
+					let destination: usize = (begin - offset) as usize;
+					let count: usize = (end - begin) as usize;
+					buf[destination..destination + count].copy_from_slice(&window_bytes[source..source + count]);
+				}
+			}
+			return Ok(());
+		}
+	}
+    for segment in &segments[first..] {
         if written == buf.len() {
             break;
         }

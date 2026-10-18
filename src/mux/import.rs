@@ -91,8 +91,6 @@ use super::inspect::{
 use super::mp4::{write_fragmented_mp4_mux, write_fragmented_mp4_mux_split};
 #[cfg(feature = "async")]
 use super::mp4::{write_fragmented_mp4_mux_async, write_fragmented_mp4_mux_split_async};
-#[cfg(feature = "async")]
-use super::write_mp4_mux_async;
 use super::{
     FlatTimingOverride, MuxDestinationMode, MuxDurationBoundaryKind, MuxError, MuxFileConfig,
     MuxInterleavePolicy, MuxMp4TrackSelector, MuxOutputLayout, MuxRawCodec, MuxRawVideoParams,
@@ -344,6 +342,22 @@ where
     mux_to_path_async_inner(&request, output_path.as_ref()).await
 }
 
+/// Async mux with output-byte progress. `(0, 0)` denotes input analysis.
+/// Flat MP4 reports exact container bytes including headers; fragmented output
+/// currently reports analysis only. Completion is the successful return value.
+#[cfg(feature = "async")]
+pub async fn mux_to_path_async_with_progress<P>(
+	request: &MuxRequest,
+	output_path: P,
+	progress: &(dyn Fn(u64, u64) + Send + Sync),
+) -> Result<(), MuxError>
+where
+	P: AsRef<Path>,
+{
+	let request: MuxRequest = request.clone().with_destination_mode(MuxDestinationMode::CreateNew);
+	mux_to_path_async_inner_with_progress(&request, output_path.as_ref(), Some(progress)).await
+}
+
 /// Async companion to [`mux_into_path`] on the file-backed Tokio surface.
 #[cfg(feature = "async")]
 #[cfg_attr(docsrs, doc(cfg(all(feature = "mux", feature = "async"))))]
@@ -380,6 +394,16 @@ where
 
 #[cfg(feature = "async")]
 async fn mux_to_path_async_inner(request: &MuxRequest, output_path: &Path) -> Result<(), MuxError> {
+	mux_to_path_async_inner_with_progress(request, output_path, None).await
+}
+
+#[cfg(feature = "async")]
+async fn mux_to_path_async_inner_with_progress(
+	request: &MuxRequest,
+	output_path: &Path,
+	progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
+) -> Result<(), MuxError> {
+	if let Some(progress) = progress { progress(0, 0); }
     let prepared = prepare_request_async(request, output_path).await?;
     let mut sources = Vec::with_capacity(prepared.source_specs.len());
     for spec in &prepared.source_specs {
@@ -391,12 +415,13 @@ async fn mux_to_path_async_inner(request: &MuxRequest, output_path: &Path) -> Re
     let mut writer = BufWriter::new(output);
     match prepared.output_layout {
         MuxOutputLayout::Flat => {
-            write_mp4_mux_async(
+            super::mp4::write_mp4_mux_async_with_progress(
                 &mut sources,
                 &mut writer,
                 &prepared.file_config,
                 &prepared.track_configs,
                 &prepared.plan,
+                progress,
             )
             .await?
         }
@@ -815,6 +840,10 @@ struct SegmentedAsyncMuxSource {
     file_path: Option<PathBuf>,
     file_position: Option<u64>,
     pending_file_seek: Option<(PathBuf, u64)>,
+	read_cache: Vec<u8>,
+	cache_path: Option<PathBuf>,
+	cache_offset: u64,
+	cache_length: usize,
 }
 
 #[cfg(feature = "async")]
@@ -839,6 +868,10 @@ impl AsyncMuxSource {
                     file_path: None,
                     file_position: None,
                     pending_file_seek: None,
+					read_cache: vec![0; 64 * 1024],
+					cache_path: None,
+					cache_offset: 0,
+					cache_length: 0,
                 })
             }
         };
@@ -964,6 +997,19 @@ impl SegmentedAsyncMuxSource {
             };
         let to_read = available.min(buf.remaining());
         let file_offset = source_offset + u64::try_from(segment_offset).unwrap();
+		// TS payload ranges are usually only 184 bytes, separated by headers.
+		// Retain a bounded physical-file window across logical seeks so copying
+		// a track does not schedule an OS seek/read for every payload range.
+		if self.cache_path.as_deref() == Some(path)
+			&& file_offset >= self.cache_offset
+			&& file_offset - self.cache_offset < self.cache_length as u64
+		{
+			let relative: usize = (file_offset - self.cache_offset) as usize;
+			let count: usize = to_read.min(self.cache_length - relative);
+			buf.put_slice(&self.read_cache[relative..relative + count]);
+			self.position += count as u64;
+			return Poll::Ready(Ok(()));
+		}
         let should_seek =
             self.file_path.as_deref() != Some(path) || self.file_position != Some(file_offset);
         if should_seek {
@@ -1002,19 +1048,24 @@ impl SegmentedAsyncMuxSource {
             }
         }
 
-        let read = {
-            let dst = buf.initialize_unfilled_to(to_read);
-            let mut limited = ReadBuf::new(dst);
-            let file = match self.file_for_path_mut(path) {
-                Ok(file) => file,
-                Err(error) => return Poll::Ready(Err(error)),
-            };
-            match Pin::new(file).poll_read(cx, &mut limited) {
-                Poll::Ready(Ok(())) => limited.filled().len(),
-                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                Poll::Pending => return Poll::Pending,
-            }
-        };
+		let mut cache: Vec<u8> = std::mem::take(&mut self.read_cache);
+		let read_result: Poll<io::Result<usize>> = {
+			let mut destination: ReadBuf<'_> = ReadBuf::new(&mut cache);
+			match self.file_for_path_mut(path) {
+				Ok(file) => match Pin::new(file).poll_read(cx, &mut destination) {
+					Poll::Ready(Ok(())) => Poll::Ready(Ok(destination.filled().len())),
+					Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
+					Poll::Pending => Poll::Pending,
+				},
+				Err(error) => Poll::Ready(Err(error)),
+			}
+		};
+		self.read_cache = cache;
+		let read: usize = match read_result {
+			Poll::Ready(Ok(read)) => read,
+			Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+			Poll::Pending => return Poll::Pending,
+		};
 
         if read == 0 {
             return Poll::Ready(Err(io::Error::new(
@@ -1022,8 +1073,12 @@ impl SegmentedAsyncMuxSource {
                 "truncated segmented mux source input",
             )));
         }
-        buf.advance(read);
-        self.position += u64::try_from(read).unwrap();
+		self.cache_path = Some(path.to_path_buf());
+		self.cache_offset = file_offset;
+		self.cache_length = read;
+		let copied: usize = to_read.min(read);
+		buf.put_slice(&self.read_cache[..copied]);
+		self.position += copied as u64;
         self.file_path = Some(path.to_path_buf());
         self.file_position = Some(file_offset + u64::try_from(read).unwrap());
         Poll::Ready(Ok(()))

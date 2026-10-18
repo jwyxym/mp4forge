@@ -757,12 +757,23 @@ fn parse_h265_sample_pocs(
     let mut pocs = Vec::with_capacity(first_vcl_nals.len());
     let mut prev_poc_lsb = 0_u32;
     let mut prev_poc_msb = 0_i32;
+	let mut epoch: u64 = 0;
+	let mut maximum_picture: Option<u64> = None;
 
     for nal in first_vcl_nals {
         let parsed =
             parse_h265_slice_poc(nal, sps_info, pps_info, prev_poc_lsb, prev_poc_msb, spec)?;
+		// An IDR resets codec POC to zero, not the output presentation clock.
+		// Keep each new IDR epoch after all pictures in the preceding GOP.
+		if matches!(hevc_nal_type(nal), 19 | 20)
+			&& let Some(maximum) = maximum_picture
+		{
+			epoch = maximum.checked_add(1)?;
+		}
+		let picture: u64 = epoch.checked_add(u64::from(parsed.poc))?;
+		maximum_picture = Some(maximum_picture.map_or(picture, |maximum: u64| maximum.max(picture)));
         pocs.push(
-            i32::try_from(parsed.poc)
+            i32::try_from(picture)
                 .ok()?
                 .checked_mul(i32::try_from(sample_duration).ok()?)?,
         );
